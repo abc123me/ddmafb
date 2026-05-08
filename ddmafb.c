@@ -252,7 +252,7 @@ static int ddmafb_parse_dt(struct platform_device *pdev,
 
 	of_property_read_u32(np, "framerate", &params->framerate);
 
-	ret = of_property_read_string(np, "dma", &str);
+	ret = of_property_read_string(np, "dma-names", &str);
 	if (ret) {
 		dev_err(&pdev->dev, "Can't parse dma property\n");
 		return ret;
