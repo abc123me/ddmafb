@@ -13,6 +13,8 @@
  */
 
 #include <linux/aperture.h>
+#include <linux/dmaengine.h>
+#include <linux/dma-mapping.h>
 #include <linux/errno.h>
 #include <linux/fb.h>
 #include <linux/io.h>
@@ -23,6 +25,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_clk.h>
+#include <linux/of_dma.h>
 #include <linux/of_platform.h>
 #include <linux/parser.h>
 #include <linux/pm_domain.h>
@@ -71,9 +74,10 @@ static int ddmafb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
 
 struct ddmafb_par {
 	u32 palette[PSEUDO_PALETTE_SIZE];
-	resource_size_t base;
-	resource_size_t size;
-	struct resource *mem;
+	struct dma_chan *dma_channel;
+	dma_addr_t dma_handle;
+	void *dma_cpu_addr;
+	size_t dma_size;
 };
 
 /*
@@ -82,16 +86,10 @@ struct ddmafb_par {
  */
 static void ddmafb_destroy(struct fb_info *info)
 {
-	struct ddmafb_par *par = info->par;
-	struct resource *mem = par->mem;
-
 	if (info->screen_base)
 		iounmap(info->screen_base);
 
 	framebuffer_release(info);
-
-	if (mem)
-		release_mem_region(mem->start, resource_size(mem));
 }
 
 static const struct fb_ops ddmafb_ops = {
@@ -107,17 +105,20 @@ struct ddmafb_params {
 	u32 width;
 	u32 height;
 	u32 stride;
+	u32 framerate;
 	struct simplefb_format *format;
-	struct resource memory;
+	const char *chan_name;
 };
 
 static int ddmafb_parse_dt(struct platform_device *pdev,
 			   struct ddmafb_params *params)
 {
-	struct device_node *np = pdev->dev.of_node, *mem;
+	struct device_node *np = pdev->dev.of_node;
 	int ret;
-	const char *format;
+	const char *str;
 	int i;
+
+	memset(params, 0, sizeof(struct ddmafb_params));
 
 	ret = of_property_read_u32(np, "width", &params->width);
 	if (ret) {
@@ -137,14 +138,19 @@ static int ddmafb_parse_dt(struct platform_device *pdev,
 		return ret;
 	}
 
-	ret = of_property_read_string(np, "format", &format);
+	ret = of_property_read_u32(np, "framerate", &params->framerate);
+	if (ret) {
+		dev_err(&pdev->dev, "Can't parse framerate property\n");
+		return ret;
+	}
+
+	ret = of_property_read_string(np, "format", &str);
 	if (ret) {
 		dev_err(&pdev->dev, "Can't parse format property\n");
 		return ret;
 	}
-	params->format = NULL;
 	for (i = 0; i < ARRAY_SIZE(ddmafb_formats); i++) {
-		if (strcmp(format, ddmafb_formats[i].name))
+		if (strcmp(str, ddmafb_formats[i].name))
 			continue;
 		params->format = &ddmafb_formats[i];
 		break;
@@ -154,22 +160,12 @@ static int ddmafb_parse_dt(struct platform_device *pdev,
 		return -EINVAL;
 	}
 
-	mem = of_parse_phandle(np, "memory-region", 0);
-	if (mem) {
-		ret = of_address_to_resource(mem, 0, &params->memory);
-		if (ret < 0) {
-			dev_err(&pdev->dev, "failed to parse memory-region\n");
-			of_node_put(mem);
-			return ret;
-		}
-
-		if (of_property_present(np, "reg"))
-			dev_warn(&pdev->dev, "preferring \"memory-region\" over \"reg\" property\n");
-
-		of_node_put(mem);
-	} else {
-		memset(&params->memory, 0, sizeof(params->memory));
+	ret = of_property_read_string(np, "dma", &str);
+	if (ret) {
+		dev_err(&pdev->dev, "Can't parse format property\n");
+		return ret;
 	}
+	params->chan_name = str;
 
 	return 0;
 }
@@ -180,7 +176,10 @@ static int ddmafb_probe(struct platform_device *pdev)
 	struct ddmafb_params params;
 	struct fb_info *info;
 	struct ddmafb_par *par;
-	struct resource *res, *mem;
+	dma_addr_t dma_handle;
+	struct dma_chan *dma_channel;
+	size_t dma_size;
+	void *dma_cpu_addr;
 
 	if (fb_get_options("ddmafb", NULL))
 		return -ENODEV;
@@ -192,39 +191,32 @@ static int ddmafb_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	if (params.memory.start == 0 && params.memory.end == 0) {
-		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-		if (!res) {
-			dev_err(&pdev->dev, "No memory resource\n");
-			return -EINVAL;
-		}
-	} else {
-		res = &params.memory;
+	dma_channel = dma_request_chan(&pdev->dev, params.chan_name);
+	if (IS_ERR(dma_channel)) {
+		dev_err(&pdev->dev, "Failed to request DMA channel %s: %ld\n", params.chan_name, PTR_ERR(dma_channel));
+		return PTR_ERR(dma_channel);
 	}
 
-	mem = request_mem_region(res->start, resource_size(res), "ddmafb");
-	if (!mem) {
-		/*
-		 * We cannot make this fatal. Sometimes this comes from magic
-		 * spaces our resource handlers simply don't know about. Use
-		 * the I/O-memory resource as-is and try to map that instead.
-		 */
-		dev_warn(&pdev->dev, "ddmafb: cannot reserve video memory at %pR\n", res);
-		mem = res;
+	dma_size = params.width * params.stride;
+	dma_cpu_addr = dma_alloc_coherent(&pdev->dev, dma_size, &dma_handle, GFP_KERNEL);
+	if (!dma_cpu_addr) {
+		dev_err(&pdev->dev, "Failed to allocate DMA buffer\n");
+		ret = -ENOMEM;
+		goto error_release_dma_channel;
 	}
 
 	info = framebuffer_alloc(sizeof(struct ddmafb_par), &pdev->dev);
 	if (!info) {
 		ret = -ENOMEM;
-		goto error_release_mem_region;
+		goto error_release_dma_region;
 	}
 	platform_set_drvdata(pdev, info);
 
 	par = info->par;
 
 	info->fix = ddmafb_fix;
-	info->fix.smem_start = mem->start;
-	info->fix.smem_len = resource_size(mem);
+	info->fix.smem_start = (size_t) dma_cpu_addr;
+	info->fix.smem_len = dma_size;
 	info->fix.line_length = params.stride;
 
 	info->var = ddmafb_var;
@@ -238,12 +230,13 @@ static int ddmafb_probe(struct platform_device *pdev)
 	info->var.blue = params.format->blue;
 	info->var.transp = params.format->transp;
 
-	par->base = info->fix.smem_start;
-	par->size = info->fix.smem_len;
+	par->dma_cpu_addr = dma_cpu_addr;
+	par->dma_channel = dma_channel;
+	par->dma_handle = dma_handle;
+	par->dma_size = dma_size;
 
 	info->fbops = &ddmafb_ops;
-	info->screen_base = ioremap_wc(info->fix.smem_start,
-				       info->fix.smem_len);
+	info->screen_base = ioremap_wc(info->fix.smem_start, info->fix.smem_len);
 	if (!info->screen_base) {
 		ret = -ENOMEM;
 		goto error_fb_release;
@@ -257,10 +250,7 @@ static int ddmafb_probe(struct platform_device *pdev)
 			     info->var.xres, info->var.yres,
 			     info->var.bits_per_pixel, info->fix.line_length);
 
-	if (mem != res)
-		par->mem = mem; /* release in clean-up handler */
-
-	ret = devm_aperture_acquire_for_platform_device(pdev, par->base, par->size);
+	ret = devm_aperture_acquire_for_platform_device(pdev, (resource_size_t) par->dma_cpu_addr, par->dma_size);
 	if (ret) {
 		dev_err(&pdev->dev, "Unable to acquire aperture: %d\n", ret);
 		goto error_unmap;
@@ -279,29 +269,34 @@ error_unmap:
 	iounmap(info->screen_base);
 error_fb_release:
 	framebuffer_release(info);
-error_release_mem_region:
-	if (mem != res)
-		release_mem_region(mem->start, resource_size(mem));
+error_release_dma_region:
+	dma_free_coherent(&pdev->dev, dma_size, dma_cpu_addr, dma_handle);
+error_release_dma_channel:
+	dma_release_channel(dma_channel);
 	return ret;
 }
 
 static void ddmafb_remove(struct platform_device *pdev)
 {
 	struct fb_info *info = platform_get_drvdata(pdev);
+	struct ddmafb_par *par = info->par;
 
-	/* ddmafb_destroy takes care of info cleanup */
-	unregister_framebuffer(info);
+	unregister_framebuffer(info); /* calls ddmafb_destroy */
+
+	dma_free_coherent(&pdev->dev, par->dma_size, par->dma_cpu_addr, par->dma_handle);
+
+	dma_release_channel(par->dma_channel);
 }
 
 static const struct of_device_id ddmafb_of_match[] = {
-	{ .compatible = "jlo,ddmafb", },
+	{ .compatible = "ddma-framebuffer", },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, ddmafb_of_match);
 
 static struct platform_driver ddmafb_driver = {
 	.driver = {
-		.name = "dma-framebuffer",
+		.name = "ddma-framebuffer",
 		.of_match_table = ddmafb_of_match,
 	},
 	.probe = ddmafb_probe,
