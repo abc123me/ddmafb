@@ -13,11 +13,13 @@
  */
 
 #include <linux/aperture.h>
+#include <linux/delay.h>
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
 #include <linux/errno.h>
 #include <linux/fb.h>
 #include <linux/io.h>
+#include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/platform_data/simplefb.h>
 #include <linux/platform_device.h>
@@ -48,8 +50,7 @@ static const struct fb_var_screeninfo ddmafb_var = {
 #define PSEUDO_PALETTE_SIZE 16
 
 static int ddmafb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
-			      u_int transp, struct fb_info *info)
-{
+			      u_int transp, struct fb_info *info) {
 	u32 *pal = info->pseudo_palette;
 	u32 cr = red >> (16 - info->var.red.length);
 	u32 cg = green >> (16 - info->var.green.length);
@@ -74,18 +75,106 @@ static int ddmafb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
 
 struct ddmafb_par {
 	u32 palette[PSEUDO_PALETTE_SIZE];
+	struct device *dev;
+	struct task_struct *dma_thread;
 	struct dma_chan *dma_channel;
 	dma_addr_t dma_handle;
 	void *dma_cpu_addr;
 	size_t dma_size;
 };
 
+static int ddmafb_thread_fn(void *data) {
+	struct ddmafb_par *par = data;
+	struct dma_async_tx_descriptor *desc;
+	struct dma_slave_config cfg;
+	struct dma_chan *chan;
+	dma_addr_t dma_handle;
+	dma_cookie_t cookie;
+	enum dma_status status;
+	size_t dma_size;
+	int ret, submit;
+
+	if(!par) {
+		pr_err("ddmafb_thread_fn: ddmafb_par pointer is NULL\n");
+		return -ENODEV;
+	}
+	if(IS_ERR(par)) {
+		pr_err("ddmafb_thread_fn: ddmafb_par pointer is error: \n", PTR_ERR(par));
+		return PTR_ERR(par);
+	}
+
+	chan = par->dma_channel;
+	dma_size = par->dma_size;
+	dma_handle = par->dma_handle;
+
+	/* Configure the channel */
+	pr_info("dmaengine_slave_config\n");
+	memset(&cfg, 0, sizeof(struct dma_slave_config));
+	cfg.direction       = DMA_MEM_TO_DEV;
+	cfg.dst_addr        = 0; /* AXI DMA uses stream interface; often 0 */
+	cfg.dst_addr_width  = DMA_SLAVE_BUSWIDTH_4_BYTES;
+	cfg.dst_maxburst    = 16;
+	ret = dmaengine_slave_config(chan, &cfg);
+	if (ret) {
+		dev_err(par->dev, "Failed to configure DMA channel: %d\n", ret);
+		return ret;
+	}
+
+	/* Start doing transfers */
+	submit = 1;
+	while (!kthread_should_stop()) {
+		if (submit) {
+			/* Prepare the descriptor */
+			pr_info("dmaengine_prep_slave_single\n");
+			desc = dmaengine_prep_slave_single(
+				chan,
+				dma_handle,                 /* DMA address of buffer */
+				dma_size,                   /* length in bytes */
+				DMA_MEM_TO_DEV,             /* direction */
+				0
+				//DMA_PREP_INTERRUPT |        /* fire callback on completion */
+				//DMA_CTRL_ACK                /* auto-ack the descriptor */
+			);
+			if (!desc) {
+				dev_err(par->dev, "Failed to prepare DMA descriptor\n");
+				return -ENOMEM;
+			}
+			pr_info("dma descriptor @ 0x%08X + 0x%08X\n", dma_handle, dma_size);
+
+			dev_info(par->dev, "dmaengine_submit\n");
+			cookie = dmaengine_submit(desc);
+			if (dma_submit_error(cookie)) {
+				dev_err(par->dev, "DMA submit failed\n");
+				return -EIO;
+			}
+
+			dev_info(par->dev, "dma_async_issue_pending\n");
+			dma_async_issue_pending(chan);
+			submit = 0;
+		}
+
+		dev_info(par->dev, "dma_async_is_tx_complete\n");
+		status = dma_async_is_tx_complete(chan, cookie, NULL, NULL);
+		if (status == DMA_COMPLETE) {
+			dev_info(par->dev, "Transfer done, starting another\n");
+			submit = 1;
+			ssleep(1);  // sleep 1 second
+		} else {
+			msleep(100);
+		}
+	}
+	return 0;
+}
+
 /*
  * fb_ops.fb_destroy is called by the last put_fb_info() call at the end
  * of unregister_framebuffer() or fb_release(). Do any cleanup here.
  */
-static void ddmafb_destroy(struct fb_info *info)
-{
+static void ddmafb_destroy(struct fb_info *info) {
+	struct ddmafb_par *par = info->par;
+
+	kthread_stop(par->dma_thread);
+
 	if (info->screen_base)
 		iounmap(info->screen_base);
 
@@ -111,8 +200,7 @@ struct ddmafb_params {
 };
 
 static int ddmafb_parse_dt(struct platform_device *pdev,
-			   struct ddmafb_params *params)
-{
+			   struct ddmafb_params *params) {
 	struct device_node *np = pdev->dev.of_node;
 	int ret;
 	const char *str;
@@ -162,7 +250,7 @@ static int ddmafb_parse_dt(struct platform_device *pdev,
 
 	ret = of_property_read_string(np, "dma", &str);
 	if (ret) {
-		dev_err(&pdev->dev, "Can't parse format property\n");
+		dev_err(&pdev->dev, "Can't parse dma property\n");
 		return ret;
 	}
 	params->chan_name = str;
@@ -170,14 +258,14 @@ static int ddmafb_parse_dt(struct platform_device *pdev,
 	return 0;
 }
 
-static int ddmafb_probe(struct platform_device *pdev)
-{
+static int ddmafb_probe(struct platform_device *pdev) {
 	int ret;
 	struct ddmafb_params params;
 	struct fb_info *info;
 	struct ddmafb_par *par;
 	dma_addr_t dma_handle;
 	struct dma_chan *dma_channel;
+	struct task_struct *dma_thread;
 	size_t dma_size;
 	void *dma_cpu_addr;
 
@@ -197,7 +285,7 @@ static int ddmafb_probe(struct platform_device *pdev)
 		return PTR_ERR(dma_channel);
 	}
 
-	dma_size = params.width * params.stride;
+	dma_size = params.height * params.stride;
 	dma_cpu_addr = dma_alloc_coherent(&pdev->dev, dma_size, &dma_handle, GFP_KERNEL);
 	if (!dma_cpu_addr) {
 		dev_err(&pdev->dev, "Failed to allocate DMA buffer\n");
@@ -230,6 +318,7 @@ static int ddmafb_probe(struct platform_device *pdev)
 	info->var.blue = params.format->blue;
 	info->var.transp = params.format->transp;
 
+	par->dev = &pdev->dev;
 	par->dma_cpu_addr = dma_cpu_addr;
 	par->dma_channel = dma_channel;
 	par->dma_handle = dma_handle;
@@ -260,8 +349,15 @@ static int ddmafb_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Unable to register ddmafb: %d\n", ret);
 		goto error_unmap;
 	}
-
 	dev_info(&pdev->dev, "fb%d: ddmafb registered!\n", info->node);
+
+	// Start the DMA thread
+	dma_thread = kthread_run(ddmafb_thread_fn, par, "ddmafb");
+	if (IS_ERR(dma_thread)) {
+		dev_err(&pdev->dev, "Failed to start DMA thread: %ld\n", PTR_ERR(dma_thread));
+		return PTR_ERR(dma_thread);
+	}
+	dev_info(&pdev->dev, "fb%d: started update thread!\n");
 
 	return 0;
 
@@ -276,8 +372,7 @@ error_release_dma_channel:
 	return ret;
 }
 
-static void ddmafb_remove(struct platform_device *pdev)
-{
+static void ddmafb_remove(struct platform_device *pdev) {
 	struct fb_info *info = platform_get_drvdata(pdev);
 	struct ddmafb_par *par = info->par;
 
